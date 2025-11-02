@@ -368,11 +368,14 @@ class PoseBoneManipulation:
                 "right_hand_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.01, "tooltip": "Scale factor for right hand size"}),
                 "right_hand_offset_x": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Horizontal offset for right hand"}),
                 "right_hand_offset_y": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Vertical offset for right hand"}),
+                "anchor_to_bottom": ("BOOLEAN", {"default": False, "tooltip": "EXPERIMENTAL: Keep feet anchored at bottom - scaling legs/torso shorter makes whole character shorter"}),
+                "generate_mask": ("BOOLEAN", {"default": False, "tooltip": "EXPERIMENTAL: Enable/disable mask generation"}),
+                "mask_padding": ("INT", {"default": 50, "min": 0, "max": 500, "step": 1, "tooltip": "EXPERIMENTAL: Padding around the pose shape for the mask output (in pixels)"}),
             },
         }
 
-    RETURN_TYPES = ("POSEDATA",)
-    RETURN_NAMES = ("pose_data",)
+    RETURN_TYPES = ("POSEDATA", "MASK",)
+    RETURN_NAMES = ("pose_data", "mask",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePreprocess"
     DESCRIPTION = "Manipulate individual bones in the pose skeleton by scaling and offsetting them for cartoonish effects."
@@ -424,7 +427,8 @@ class PoseBoneManipulation:
                 left_leg_scale, left_leg_offset_x, left_leg_offset_y,
                 right_leg_scale, right_leg_offset_x, right_leg_offset_y,
                 left_hand_scale, left_hand_offset_x, left_hand_offset_y,
-                right_hand_scale, right_hand_offset_x, right_hand_offset_y):
+                right_hand_scale, right_hand_offset_x, right_hand_offset_y,
+                anchor_to_bottom, generate_mask, mask_padding):
 
         import copy
 
@@ -435,6 +439,11 @@ class PoseBoneManipulation:
         for meta in modified_pose_data["pose_metas"]:
             width = meta.width
             height = meta.height
+
+            # Store original lowest point at the very start before any manipulations
+            if anchor_to_bottom:
+                # Get the lowest ankle position (larger Y = lower in image)
+                original_bottom_y = max(meta.kps_body[10][1], meta.kps_body[13][1])
 
             # Body keypoint indices:
             # 0: Nose, 1: Neck, 2: RShoulder, 3: RElbow, 4: RWrist,
@@ -603,6 +612,24 @@ class PoseBoneManipulation:
                 self.manipulate_keypoints(meta.kps_rhand, right_hand_indices, 0, right_hand_scale,
                                          right_hand_offset_x, right_hand_offset_y, hand_size, hand_size)
 
+            # Apply anchoring if enabled - move everything so feet stay at original position
+            if anchor_to_bottom:
+                # Calculate new lowest ankle position after all manipulations
+                new_bottom_y = max(meta.kps_body[10][1], meta.kps_body[13][1])
+
+                # Calculate the vertical shift needed to keep feet at same position
+                anchor_shift = original_bottom_y - new_bottom_y
+
+                # Apply shift to all body keypoints
+                for i in range(len(meta.kps_body)):
+                    meta.kps_body[i][1] += anchor_shift
+
+                # Apply shift to hands if they exist
+                if meta.kps_lhand is not None and len(meta.kps_lhand) > 0:
+                    meta.kps_lhand[:, 1] += anchor_shift
+                if meta.kps_rhand is not None and len(meta.kps_rhand) > 0:
+                    meta.kps_rhand[:, 1] += anchor_shift
+
         # Also update pose_metas_original if it exists
         if "pose_metas_original" in modified_pose_data:
             for meta_orig in modified_pose_data["pose_metas_original"]:
@@ -613,6 +640,11 @@ class PoseBoneManipulation:
                 kps_body = meta_orig["keypoints_body"][:, :2] * np.array([width, height])
                 kps_lhand = meta_orig["keypoints_left_hand"][:, :2] * np.array([width, height])
                 kps_rhand = meta_orig["keypoints_right_hand"][:, :2] * np.array([width, height])
+
+                # Store original lowest point at the very start before any manipulations
+                if anchor_to_bottom:
+                    # Get the lowest ankle position (larger Y = lower in image)
+                    original_bottom_y = max(kps_body[10][1], kps_body[13][1])
 
                 # Calculate skeleton dimensions for relative offsets
                 skeleton_height = np.abs(kps_body[0][1] - max(kps_body[10][1], kps_body[13][1]))
@@ -745,12 +777,146 @@ class PoseBoneManipulation:
                     self.manipulate_keypoints(kps_rhand, right_hand_indices, 0, right_hand_scale,
                                              right_hand_offset_x, right_hand_offset_y, hand_size, hand_size)
 
+                # Apply anchoring if enabled - move everything so feet stay at original position
+                if anchor_to_bottom:
+                    # Calculate new lowest ankle position after all manipulations
+                    new_bottom_y = max(kps_body[10][1], kps_body[13][1])
+
+                    # Calculate the vertical shift needed to keep feet at same position
+                    anchor_shift = original_bottom_y - new_bottom_y
+
+                    # Apply shift to all body keypoints
+                    kps_body[:, 1] += anchor_shift
+
+                    # Apply shift to hands if they exist
+                    if kps_lhand is not None and len(kps_lhand) > 0:
+                        kps_lhand[:, 1] += anchor_shift
+                    if kps_rhand is not None and len(kps_rhand) > 0:
+                        kps_rhand[:, 1] += anchor_shift
+
                 # Normalize back
                 meta_orig["keypoints_body"][:, :2] = kps_body / np.array([width, height])
                 meta_orig["keypoints_left_hand"][:, :2] = kps_lhand / np.array([width, height])
                 meta_orig["keypoints_right_hand"][:, :2] = kps_rhand / np.array([width, height])
 
-        return (modified_pose_data,)
+        # Generate mask for each frame
+        masks = []
+
+        if not generate_mask:
+            # Return empty masks if mask generation is disabled
+            for meta in modified_pose_data["pose_metas"]:
+                mask = np.zeros((meta.height, meta.width), dtype=np.float32)
+                masks.append(mask)
+        else:
+            for meta in modified_pose_data["pose_metas"]:
+                width = meta.width
+                height = meta.height
+
+                # Create a blank mask
+                mask = np.zeros((height, width), dtype=np.uint8)
+
+                # Helper function to check if a keypoint is valid
+                def is_valid_keypoint(kp, width, height):
+                    if kp is None or len(kp) < 2:
+                        return False
+                    # Check if within reasonable bounds (with some tolerance for edge cases)
+                    x, y = kp[0], kp[1]
+                    if x < -width * 0.5 or x > width * 1.5:
+                        return False
+                    if y < -height * 0.5 or y > height * 1.5:
+                        return False
+                    # Check for confidence if available (index 2)
+                    if len(kp) >= 3 and kp[2] < 0.1:  # Low confidence threshold
+                        return False
+                    return True
+
+                # Define skeleton connections (same as pose visualization)
+                # Body connections: [start_idx, end_idx]
+                body_connections = [
+                    [0, 1],   # Nose to Neck
+                    [1, 2],   # Neck to RShoulder
+                    [2, 3],   # RShoulder to RElbow
+                    [3, 4],   # RElbow to RWrist
+                    [1, 5],   # Neck to LShoulder
+                    [5, 6],   # LShoulder to LElbow
+                    [6, 7],   # LElbow to LWrist
+                    [1, 8],   # Neck to RHip
+                    [8, 9],   # RHip to RKnee
+                    [9, 10],  # RKnee to RAnkle
+                    [1, 11],  # Neck to LHip
+                    [11, 12], # LHip to LKnee
+                    [12, 13], # LKnee to LAnkle
+                    [0, 14],  # Nose to REye
+                    [14, 16], # REye to REar
+                    [0, 15],  # Nose to LEye
+                    [15, 17], # LEye to LEar
+                    [10, 19], # RAnkle to RToe
+                    [13, 18], # LAnkle to LToe
+                ]
+
+                # Calculate appropriate line thickness based on skeleton size
+                # Use only valid keypoints for calculation
+                valid_y_coords = []
+                for idx in [0, 10, 13]:  # Head and ankles
+                    if idx < len(meta.kps_body) and is_valid_keypoint(meta.kps_body[idx], width, height):
+                        valid_y_coords.append(meta.kps_body[idx][1])
+
+                if len(valid_y_coords) >= 2:
+                    skeleton_height = np.abs(max(valid_y_coords) - min(valid_y_coords))
+                else:
+                    skeleton_height = height * 0.5
+
+                line_thickness = max(5, int(skeleton_height * 0.05))  # 5% of skeleton height, minimum 5 pixels
+
+                # Draw body skeleton connections
+                for connection in body_connections:
+                    start_idx, end_idx = connection
+                    if start_idx < len(meta.kps_body) and end_idx < len(meta.kps_body):
+                        start_pt = meta.kps_body[start_idx]
+                        end_pt = meta.kps_body[end_idx]
+
+                        # Only draw if both keypoints are valid
+                        if is_valid_keypoint(start_pt, width, height) and is_valid_keypoint(end_pt, width, height):
+                            pt1 = (int(np.clip(start_pt[0], 0, width - 1)), int(np.clip(start_pt[1], 0, height - 1)))
+                            pt2 = (int(np.clip(end_pt[0], 0, width - 1)), int(np.clip(end_pt[1], 0, height - 1)))
+                            cv2.line(mask, pt1, pt2, 255, thickness=line_thickness)
+
+                # Draw circles at body keypoints for thicker coverage
+                for kp in meta.kps_body:
+                    if is_valid_keypoint(kp, width, height):
+                        pt = (int(np.clip(kp[0], 0, width - 1)), int(np.clip(kp[1], 0, height - 1)))
+                        cv2.circle(mask, pt, line_thickness // 2, 255, -1)
+
+                # Draw hand keypoints as filled circles if they exist
+                hand_size = max(3, line_thickness // 3)
+
+                if meta.kps_lhand is not None and len(meta.kps_lhand) > 0:
+                    for kp in meta.kps_lhand:
+                        if is_valid_keypoint(kp, width, height):
+                            pt = (int(np.clip(kp[0], 0, width - 1)), int(np.clip(kp[1], 0, height - 1)))
+                            cv2.circle(mask, pt, hand_size, 255, -1)
+
+                if meta.kps_rhand is not None and len(meta.kps_rhand) > 0:
+                    for kp in meta.kps_rhand:
+                        if is_valid_keypoint(kp, width, height):
+                            pt = (int(np.clip(kp[0], 0, width - 1)), int(np.clip(kp[1], 0, height - 1)))
+                            cv2.circle(mask, pt, hand_size, 255, -1)
+
+                # Apply dilation to add padding and smooth the mask
+                if mask_padding > 0:
+                    kernel_size = mask_padding * 2 + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                    mask = cv2.dilate(mask, kernel, iterations=1)
+
+                # Convert to float32 and normalize to 0-1
+                mask = mask.astype(np.float32) / 255.0
+
+                masks.append(mask)
+
+        # Convert masks to tensor (B, H, W)
+        masks_tensor = torch.from_numpy(np.stack(masks, axis=0)).float()
+
+        return (modified_pose_data, masks_tensor)
 
 NODE_CLASS_MAPPINGS = {
     "OnnxDetectionModelLoader": OnnxDetectionModelLoader,
